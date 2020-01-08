@@ -28,7 +28,7 @@ VERSION     = $(shell grep '^\#define VERSION ' ../config.h | cut -d '"' -f2)
 
 # PROGS intentionally omit afl-as, which gets installed elsewhere.
 
-PROGS       = afl-gcc afl-fuzz afl-showmap afl-tmin afl-gotcpu afl-analyze
+PROGS       = afl-gcc afl-fuzz afl-showmap afl-showmap-forkserver afl-tmin afl-gotcpu afl-analyze
 SH_PROGS    = afl-plot afl-cmin afl-whatsup afl-system-config
 MANPAGES=$(foreach p, $(PROGS) $(SH_PROGS), $(p).8)
 
@@ -248,6 +248,9 @@ afl-fuzz: include/afl-fuzz.h $(AFL_FUZZ_FILES) src/afl-common.o src/afl-sharedme
 
 afl-showmap: src/afl-showmap.c src/afl-common.o src/afl-sharedmem.o $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) src/$@.c src/afl-common.o src/afl-sharedmem.o -o $@ $(LDFLAGS)
+
+afl-showmap-forkserver: src/afl-showmap-forkserver.c src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o $(COMM_HDR) | test_x86
+	$(CC) $(CFLAGS) src/$@.c src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o -o $@ $(LDFLAGS)
 
 afl-tmin: src/afl-tmin.c src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) src/$@.c src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o -o $@ $(LDFLAGS)
