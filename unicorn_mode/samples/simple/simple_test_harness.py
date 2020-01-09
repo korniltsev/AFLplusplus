@@ -119,8 +119,12 @@ def main():
         # Write the mutated command into the data buffer
         uc.mem_write(DATA_ADDRESS, input)
 
+    def my_validate_crash_callback(uc, err, input,b,c):
+        print("my_validate_crash_callback", err)
+        return False
+
     # Start the fuzzer.
-    uc.afl_fuzz(args.input_file, place_input_callback, [end_address])
+    uc.afl_fuzz(args.input_file, place_input_callback, [end_address], always_validate=True, validate_crash_callback=my_validate_crash_callback)
 
 if __name__ == "__main__":
     main()
