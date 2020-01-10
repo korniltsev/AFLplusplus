@@ -1,8 +1,8 @@
 """
     unicorn_loader.py
-    
-    Loads a process context dumped created using a 
-    Unicorn Context Dumper script into a Unicorn Engine 
+
+    Loads a process context dumped created using a
+    Unicorn Context Dumper script into a Unicorn Engine
     instance. Once this is performed emulation can be
     started.
 """
@@ -97,7 +97,7 @@ class UnicornSimpleHeap(object):
                 continue
         # Something went very wrong
         if chunk == None:
-            return 0    
+            return 0
         self._chunks.append(chunk)
         return chunk.data_addr
 
@@ -112,8 +112,8 @@ class UnicornSimpleHeap(object):
         old_chunk = None
         for chunk in self._chunks:
             if chunk.data_addr == ptr:
-                old_chunk = chunk 
-        new_chunk_addr = self.malloc(new_size) 
+                old_chunk = chunk
+        new_chunk_addr = self.malloc(new_size)
         if old_chunk != None:
             self._uc.mem_write(new_chunk_addr, str(self._uc.mem_read(old_chunk.data_addr, old_chunk.data_size)))
             self.free(old_chunk.data_addr)
@@ -143,9 +143,28 @@ class UnicornSimpleHeap(object):
 #---------------------------
 #---- Loading function
 
+class LazySegment():
+    def __init__(self, name, addr, sz, prot, content_file):
+        self.name = name
+        self.addr = addr
+        self.sz = sz
+        self.prot = prot
+        self.content_file = content_file
+        self.mmaped = False
+
+    def check(self, addr):
+        return addr >= self.addr and addr < self.addr + self.sz
+
+class LazySegmentsConfig():
+    def __init__(self, cache_name, force_load, mmap_on_fail):
+        self.cache_name = cache_name
+        self.cache_dir = "lazy_cache/" + self.cache_name
+        self.force_load = force_load
+        self.mmap_on_fail = mmap_on_fail
+
 class AflUnicornEngine(Uc):
 
-    def __init__(self, context_directory, enable_trace=False, debug_print=False):
+    def __init__(self, context_directory, enable_trace=False, debug_print=False, lazy_segments_config=None):
         """
         Initializes an AflUnicornEngine instance, which extends standard the UnicornEngine
         with a bunch of helper routines that are useful for creating afl-unicorn test harnesses.
@@ -207,16 +226,19 @@ class AflUnicornEngine(Uc):
                     except Exception as e:
                         if debug_print:
                             print("ERROR writing hex string register: {}, value: {} -- {}".format(register, value, repr(e)))
-                        
+
         # Setup the memory map and load memory content
-        self.__map_segments(context['segments'], context_directory, debug_print)
-        
+        if lazy_segments_config is None:
+            self.__map_segments(context['segments'], context_directory, debug_print)
+        else:
+            self.__map_segments_lazy(context['segments'], context_directory, debug_print, lazy_segments_config)
+
         if enable_trace:
             self.hook_add(UC_HOOK_BLOCK, self.__trace_block)
             self.hook_add(UC_HOOK_CODE, self.__trace_instruction)
             self.hook_add(UC_HOOK_MEM_WRITE | UC_HOOK_MEM_READ, self.__trace_mem_access)
             self.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_READ_INVALID, self.__trace_mem_invalid_access)
-            
+
         if debug_print:
             print("Done loading context.")
 
@@ -228,7 +250,7 @@ class AflUnicornEngine(Uc):
 
     def get_arch_str(self):
         return self._arch_str
-                    
+
     def force_crash(self, uc_error):
         """ This function should be called to indicate to AFL that a crash occurred during emulation.
             You can pass the exception received from Uc.emu_start
@@ -278,6 +300,7 @@ class AflUnicornEngine(Uc):
         mem_end_aligned = ALIGN_PAGE_UP(mem_end)
         if debug_print:
             if mem_start_aligned != mem_start or mem_end_aligned != mem_end:
+                assert False
                 print("Aligning segment to page boundary:")
                 print("  name:  {}".format(name))
                 print("  start: {0:016x} -> {1:016x}".format(mem_start, mem_start_aligned))
@@ -289,7 +312,7 @@ class AflUnicornEngine(Uc):
 
     def __map_segments(self, segment_list, context_directory, debug_print=False):
         for segment in segment_list:
-            
+
             # Get the segment information from the index
             name = segment['name']
             seg_start = segment['start']
@@ -297,7 +320,7 @@ class AflUnicornEngine(Uc):
             perms = \
                 (UC_PROT_READ  if segment['permissions']['r'] == True else 0) | \
                 (UC_PROT_WRITE if segment['permissions']['w'] == True else 0) | \
-                (UC_PROT_EXEC  if segment['permissions']['x'] == True else 0)        
+                (UC_PROT_EXEC  if segment['permissions']['x'] == True else 0)
 
             if debug_print:
                 print("Handling segment {}".format(name))
@@ -322,7 +345,9 @@ class AflUnicornEngine(Uc):
                     overlap_end = True
                     tmp = mem_start
                     break
-
+            assert not found
+            assert not overlap_start
+            assert not overlap_end
             # Map memory into the address space if it is of an acceptable size.
             if (seg_end - seg_start) > MAX_ALLOWABLE_SEG_SIZE:
                 if debug_print:
@@ -349,12 +374,85 @@ class AflUnicornEngine(Uc):
                 content_file = open(content_file_path, 'rb')
                 compressed_content = content_file.read()
                 content_file.close()
-                self.mem_write(seg_start, zlib.decompress(compressed_content)) 
+                self.mem_write(seg_start, zlib.decompress(compressed_content))
 
             else:
                 if debug_print:
                     print("No content found for segment {0} @ {1:016x}".format(name, seg_start))
                 self.mem_write(seg_start, '\x00' * (seg_end - seg_start))
+
+    def __map_segment_lazy(self, seg):
+        if seg.mmaped:
+            return
+        # print 'lazy map ', seg.name, hex(seg.addr), hex(seg.addr + seg.sz)
+        assert seg.content_file is not None
+
+        with open(seg.content_file, 'rb') as content_file:
+            compressed_content = content_file.read()
+
+        self.mem_map(seg.addr, seg.sz, seg.prot)
+        self.mem_write(seg.addr, zlib.decompress(compressed_content))
+        open(self.lazy_config.cache_dir + "/" + hex(seg.addr), 'a').close()
+        seg.mmaped = True
+
+
+    def __lazy_map_hook(self, uc, access, address, size, value, user_data):
+        ok = True
+        for s in self.parsed_lazy_segments:  # 1k list, optimize?
+            if s.check(address):
+                self.__map_segment_lazy(s)
+                ok = True
+            if s.check(address + size):
+                self.__map_segment_lazy(s)
+                ok = True
+        return ok
+
+    def __map_segments_lazy(self, segment_list, context_directory, debug_print, cfg):
+        print "lazy loading"
+        self.parsed_lazy_segments = []
+        self.lazy_config = cfg
+        for segment in segment_list:
+            name = segment['name']
+            seg_start = segment['start']
+            seg_end = segment['end']
+            perms = \
+                (UC_PROT_READ if segment['permissions']['r'] == True else 0) | \
+                (UC_PROT_WRITE if segment['permissions']['w'] == True else 0) | \
+                (UC_PROT_EXEC if segment['permissions']['x'] == True else 0)
+
+            assert (seg_end - seg_start) <= MAX_ALLOWABLE_SEG_SIZE
+            assert seg_start == ALIGN_PAGE_DOWN(seg_start)
+            assert seg_end == ALIGN_PAGE_UP(seg_end)
+            assert seg_start < seg_end
+
+            content_file = None
+            if 'content_file' in segment and len(segment['content_file']) > 0:
+                content_file = os.path.join(context_directory, segment['content_file'])
+                assert os.path.isfile(content_file)
+
+            seg = LazySegment(name, seg_start, seg_end-seg_start, perms, content_file)
+            self.parsed_lazy_segments.append(seg)
+
+        if not os.path.exists("lazy_cache"):
+            os.mkdir('lazy_cache')
+
+        if not os.path.exists(cfg.cache_dir):
+            os.mkdir(cfg.cache_dir)
+
+        for i in os.listdir(cfg.cache_dir):
+            if debug_print:
+                print 'loading cached', i
+            cfg.force_load.append(int(i, 16))
+
+        for s in self.parsed_lazy_segments:
+            for j in cfg.force_load:
+                if type(j) == str and j in s.name:
+                    self.__map_segment_lazy(s)
+                elif (type(j) == int or type(j) == long) and s.check(j):
+                    self.__map_segment_lazy(s)
+
+        if cfg.mmap_on_fail:
+            self.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED | UC_HOOK_MEM_READ_UNMAPPED |UC_HOOK_MEM_FETCH_UNMAPPED, self.__lazy_map_hook)
 
     def __get_arch_and_mode(self, arch_str):
         arch_map = {
@@ -418,10 +516,10 @@ class AflUnicornEngine(Uc):
                 "esp":    UC_X86_REG_ESP,
                 "eip":    UC_X86_REG_EIP,
                 "esp":    UC_X86_REG_ESP,
-                "efl":    UC_X86_REG_EFLAGS,        
+                "efl":    UC_X86_REG_EFLAGS,
                 # Segment registers removed...
                 # They caused segfaults (from unicorn?) when they were here
-            },        
+            },
             "arm" : {
                 "r0":     UC_ARM_REG_R0,
                 "r1":     UC_ARM_REG_R1,
@@ -476,7 +574,7 @@ class AflUnicornEngine(Uc):
                 "fp":     UC_ARM64_REG_FP,
                 "lr":     UC_ARM64_REG_LR,
                 "nzcv":   UC_ARM64_REG_NZCV,
-                "cpsr": UC_ARM_REG_CPSR, 
+                "cpsr": UC_ARM_REG_CPSR,
             },
             "mips" : {
                 "0" :     UC_MIPS_REG_ZERO,
@@ -499,13 +597,13 @@ class AflUnicornEngine(Uc):
                 "t9":     UC_MIPS_REG_T9,
                 "s0":     UC_MIPS_REG_S0,
                 "s1":     UC_MIPS_REG_S1,
-                "s2":     UC_MIPS_REG_S2,    
+                "s2":     UC_MIPS_REG_S2,
                 "s3":     UC_MIPS_REG_S3,
                 "s4":     UC_MIPS_REG_S4,
                 "s5":     UC_MIPS_REG_S5,
-                "s6":     UC_MIPS_REG_S6,              
+                "s6":     UC_MIPS_REG_S6,
                 "s7":     UC_MIPS_REG_S7,
-                "s8":     UC_MIPS_REG_S8,  
+                "s8":     UC_MIPS_REG_S8,
                 "k0":     UC_MIPS_REG_K0,
                 "k1":     UC_MIPS_REG_K1,
                 "gp":     UC_MIPS_REG_GP,
@@ -517,12 +615,12 @@ class AflUnicornEngine(Uc):
                 "lo":     UC_MIPS_REG_LO
             }
         }
-        return registers[arch]   
+        return registers[arch]
 
     #---------------------------
-    # Callbacks for tracing 
+    # Callbacks for tracing
 
-    # TODO: Make integer-printing fixed widths dependent on bitness of architecture 
+    # TODO: Make integer-printing fixed widths dependent on bitness of architecture
     #       (i.e. only show 4 bytes for 32-bit, 8 bytes for 64-bit)
 
     # TODO: Figure out how best to determine the capstone mode and architecture here
@@ -541,20 +639,19 @@ class AflUnicornEngine(Uc):
     """
 
     def __trace_instruction(self, uc, address, size, user_data):
-        print("    Instr: addr=0x{0:016x}, size=0x{1:016x}".format(address, size))  
-        
+        print("    Instr: addr=0x{0:016x}, size=0x{1:016x}".format(address, size))
+
     def __trace_block(self, uc, address, size, user_data):
         print("Basic Block: addr=0x{0:016x}, size=0x{1:016x}".format(address, size))
-      
+
     def __trace_mem_access(self, uc, access, address, size, value, user_data):
         if access == UC_MEM_WRITE:
             print("        >>> Write: addr=0x{0:016x} size={1} data=0x{2:016x}".format(address, size, value))
         else:
-            print("        >>> Read: addr=0x{0:016x} size={1}".format(address, size))    
+            print("        >>> Read: addr=0x{0:016x} size={1}".format(address, size))
 
     def __trace_mem_invalid_access(self, uc, access, address, size, value, user_data):
         if access == UC_MEM_WRITE_UNMAPPED:
             print("        >>> INVALID Write: addr=0x{0:016x} size={1} data=0x{2:016x}".format(address, size, value))
         else:
-            print("        >>> INVALID Read: addr=0x{0:016x} size={1}".format(address, size))   
-
+            print("        >>> INVALID Read: addr=0x{0:016x} size={1}".format(address, size))
